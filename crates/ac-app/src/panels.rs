@@ -30,6 +30,21 @@ pub struct LibraryState {
     pub rename_folder: Option<(String, String)>,
     /// Library item Properties dialog.
     pub props: Option<ItemProps>,
+    /// Thumbnails of the Frame Picker (Properties › First frame › Pick…).
+    fp: FramePickerCache,
+    /// Search text of the Swap Symbol list.
+    swap_search: String,
+}
+
+/// Frame Picker thumbnails, redrawn when the document changes.
+#[derive(Default)]
+struct FramePickerCache {
+    symbol: u32,
+    frames: u32,
+    /// `Editor::revision` the thumbnails were drawn at.
+    revision: u64,
+    bounds: Option<(Pt, Pt)>,
+    tex: std::collections::HashMap<u32, egui::TextureHandle>,
 }
 
 /// Library › Properties… for one item.
@@ -45,7 +60,7 @@ pub struct ItemProps {
 
 impl Default for LibraryState {
     fn default() -> Self {
-        LibraryState { open: true, search: String::new(), play: false, frame: 0, accum: 0.0, sort: (0, true), bitmap: None, drag_bitmap: None, sound: None, drag_sound: None, open_folders: Default::default(), rename_folder: None, props: None }
+        LibraryState { open: true, search: String::new(), play: false, frame: 0, accum: 0.0, sort: (0, true), bitmap: None, drag_bitmap: None, sound: None, drag_sound: None, open_folders: Default::default(), rename_folder: None, props: None, fp: Default::default(), swap_search: String::new() }
     }
 }
 
@@ -76,9 +91,10 @@ fn panel_title(app: &mut App, ui: &mut egui::Ui, module: crate::dock::Module, ti
 pub fn right_panel(app: &mut App, ctx: &egui::Context) {
     egui::SidePanel::new(app.layout.props_side(), "props").default_width(300.0).min_width(250.0).max_width((ctx.screen_rect().width() * 0.45).max(320.0)).show(ctx, |ui| {
         let lib_here = app.lib.open && app.layout.library == crate::dock::LibraryDock::WithProperties;
+        let fp_here = app.frame_picker_open && app.layout.frame_picker == crate::dock::FramePickerDock::WithProperties;
         let total = ui.available_height();
-        // Properties take what they need (scrolling past a cap); the Library fills the rest.
-        let props_max = if lib_here { (total - 220.0).max(160.0) } else { total - 30.0 };
+        // Properties take what they need (scrolling past a cap); the Library (and the Frame Picker) fill the rest.
+        let props_max = if lib_here || fp_here { (total - 220.0).max(160.0) } else { total - 30.0 };
         panel_title(app, ui, crate::dock::Module::Properties, "Properties");
         egui::ScrollArea::vertical().id_salt("props-scroll").max_height(props_max).auto_shrink([false, true]).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -104,7 +120,18 @@ pub fn right_panel(app: &mut App, ctx: &egui::Context) {
         if lib_here {
             ui.add_space(2.0);
             panel_title(app, ui, crate::dock::Module::Library, "Library");
-            library(app, ui);
+            if fp_here {
+                // with the Frame Picker below, the Library takes about half of what is left
+                let h = (ui.available_height() * 0.5).max(180.0);
+                ui.allocate_ui(vec2(ui.available_width(), h), |ui| library(app, ui));
+            } else {
+                library(app, ui);
+            }
+        }
+        if fp_here {
+            ui.add_space(2.0);
+            frame_picker_title(app, ui);
+            frame_picker_body(app, ui);
         }
     });
 }
@@ -679,6 +706,9 @@ fn object_properties(app: &mut App, ui: &mut egui::Ui) {
                         ui.label("First frame");
                         let r = ui.add(egui::DragValue::new(&mut ff).range(1..=999));
                         apply(app, &r, "First Frame", |e| if let ElementKind::Instance(i) = &mut e.kind { i.first_frame = ff - 1 });
+                        if ui.button("Pick…").on_hover_text("Open the Frame Picker (Window › Frame Picker)").clicked() {
+                            app.frame_picker_open = true;
+                        }
                     });
                 }
                 color_effect(app, ui, &el);
@@ -693,16 +723,32 @@ fn object_properties(app: &mut App, ui: &mut egui::Ui) {
                     let cur = app.ed.doc.symbol(id).map(|s| s.name.clone()).unwrap_or_default();
                     let mut pick = None;
                     egui::ComboBox::from_id_salt("swap-symbol").width((ui.available_width() - 80.0).clamp(60.0, 220.0)).selected_text(ellipsize(&cur, 30)).show_ui(ui, |ui| {
-                        for sym in &app.ed.doc.library {
-                            if Some(sym.id) == app.ed.editing || sym.name == ac_core::editor::GROUP_EDIT_NAME {
-                                continue; // a symbol can't contain itself
-                            }
-                            if ui.selectable_label(sym.id == id, ellipsize(&sym.name, 60)).clicked() && sym.id != id {
-                                pick = Some(sym.id);
-                            }
+                        ui.add(egui::TextEdit::singleline(&mut app.lib.swap_search).hint_text("🔍 Search symbols").desired_width(200.0));
+                        let q = app.lib.swap_search.to_lowercase();
+                        let editing = app.ed.editing; // a symbol can't contain itself
+                        let choices: Vec<(u32, &str)> = app
+                            .ed
+                            .doc
+                            .library
+                            .iter()
+                            .filter(|s| Some(s.id) != editing && s.name != ac_core::editor::GROUP_EDIT_NAME && (q.is_empty() || s.name.to_lowercase().contains(&q)))
+                            .map(|s| (s.id, s.name.as_str()))
+                            .collect();
+                        if choices.is_empty() {
+                            ui.label(RichText::new("No symbols match").small().color(Color32::from_gray(150)));
                         }
+                        // only the rows in view are built, so a long library stays fast
+                        let row_h = ui.spacing().interact_size.y;
+                        egui::ScrollArea::vertical().max_height(260.0).show_rows(ui, row_h, choices.len(), |ui, range| {
+                            for &(sid, name) in &choices[range] {
+                                if ui.selectable_label(sid == id, ellipsize(name, 60)).clicked() && sid != id {
+                                    pick = Some(sid);
+                                }
+                            }
+                        });
                     }).response.on_hover_text("Swap Symbol: keep this instance's transform and effects, show another symbol");
                     if let Some(new_id) = pick {
+                        app.lib.swap_search.clear();
                         app.ed.swap_symbol(new_id);
                     }
                     if ui.button("Duplicate").on_hover_text("Duplicate Symbol and swap: copy this symbol (same library folder) and show the copy here, so you can change it without changing the other instances").clicked() {
@@ -1260,6 +1306,166 @@ fn document_properties(app: &mut App, ui: &mut egui::Ui) {
     });
 }
 
+/// Window › Frame Picker as a floating window (its default). Drag the grip at its top
+/// onto a place in the dock to dock it (dock.rs).
+pub fn frame_picker_window(app: &mut App, ctx: &egui::Context) {
+    if !app.frame_picker_open || app.layout.frame_picker != crate::dock::FramePickerDock::Floating {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new("Frame Picker").open(&mut open).resizable(true).default_size(vec2(360.0, 320.0)).default_pos(app.stage_rect.right_top() + vec2(-380.0, 60.0)).show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            crate::dock::grip(app, ui, crate::dock::Module::FramePicker, Some("Drag to dock"));
+        });
+        frame_picker_body(app, ui);
+    });
+    if !open {
+        app.frame_picker_open = false;
+    }
+}
+
+/// The Frame Picker docked in its own column, left or right (drag its grip, or Workspace › Frame Picker).
+pub fn frame_picker_column(app: &mut App, ctx: &egui::Context) {
+    let side = match app.layout.frame_picker {
+        crate::dock::FramePickerDock::Left => egui::panel::Side::Left,
+        crate::dock::FramePickerDock::Right => egui::panel::Side::Right,
+        _ => return,
+    };
+    if !app.frame_picker_open {
+        return;
+    }
+    egui::SidePanel::new(side, "frame-picker-col").default_width(270.0).min_width(200.0).show(ctx, |ui| {
+        frame_picker_title(app, ui);
+        frame_picker_body(app, ui);
+    });
+}
+
+/// The docked Frame Picker's title bar: grip to move it, and a close button.
+fn frame_picker_title(app: &mut App, ui: &mut egui::Ui) {
+    egui::Frame::none().fill(Color32::from_gray(0x2A)).inner_margin(egui::Margin::symmetric(4.0, 2.0)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            crate::dock::grip(app, ui, crate::dock::Module::FramePicker, Some("Frame Picker"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("✕").on_hover_text("Close (Window › Frame Picker opens it again)").clicked() {
+                    app.frame_picker_open = false;
+                }
+            });
+        });
+    });
+}
+
+/// What the Frame Picker shows wherever it sits: the frames of the selected graphic symbol
+/// instance; click one to make it the instance's First frame.
+fn frame_picker_body(app: &mut App, ui: &mut egui::Ui) {
+    let target = (app.ed.selection.len() == 1).then(|| app.ed.selected_element()).flatten().and_then(|el| match &el.kind {
+        ElementKind::Instance(i) if app.ed.doc.symbol(i.symbol).is_some_and(|s| s.kind == SymbolKind::Graphic) => Some((i.symbol, i.first_frame)),
+        _ => None,
+    });
+    let Some((symbol, current)) = target else {
+        hint(ui, "Select a graphic symbol instance on the stage to pick its first frame.");
+        return;
+    };
+    let editable = app.ed.selection.iter().all(|s| app.ed.layer_editable(s.layer));
+    ui.add_enabled_ui(editable, |ui| {
+        if let Some(f) = frame_picker(app, ui, symbol, current) {
+            app.ed.modify_selected("First Frame", move |e| if let ElementKind::Instance(i) = &mut e.kind { i.first_frame = f });
+        }
+    });
+}
+
+/// A thumbnail for every frame of a graphic symbol. Returns the frame (0-based) that was clicked.
+fn frame_picker(app: &mut App, ui: &mut egui::Ui, symbol: u32, current: u32) -> Option<u32> {
+    let mut cache = std::mem::take(&mut app.lib.fp);
+    let out = frame_picker_inner(&app.ed.doc, app.ed.revision, &mut cache, ui, symbol, current);
+    app.lib.fp = cache;
+    out
+}
+
+fn frame_picker_inner(doc: &ac_core::Document, revision: u64, cache: &mut FramePickerCache, ui: &mut egui::Ui, symbol: u32, current: u32) -> Option<u32> {
+    const THUMB: f32 = 56.0;
+    let sym = doc.symbol(symbol)?;
+    let frames = sym.timeline.frame_count().max(1);
+    // any edit, undo or redo bumps the revision, and the thumbnails start over
+    if cache.symbol != symbol || cache.frames != frames || cache.revision != revision {
+        *cache = FramePickerCache { symbol, frames, revision, ..Default::default() };
+        // one view for every thumbnail, from the union of sampled frames (as the Library preview does)
+        let mut bounds: Option<(Pt, Pt)> = None;
+        for k in (0..frames).step_by(((frames / 12).max(1)) as usize) {
+            let mut items = Vec::new();
+            ac_core::evaluate(&ac_core::EvalCtx::new(doc, k), &sym.timeline, k, &Matrix::IDENTITY, 1.0, 1, &mut items);
+            for b in items.iter().filter_map(|it| it.path.transformed(&it.matrix).bounds()) {
+                bounds = Some(match bounds {
+                    None => b,
+                    Some(a) => (pt(a.0.x.min(b.0.x), a.0.y.min(b.0.y)), pt(a.1.x.max(b.1.x), a.1.y.max(b.1.y))),
+                });
+            }
+        }
+        cache.bounds = bounds;
+    }
+    let ppp = ui.ctx().pixels_per_point();
+    let px = (THUMB * ppp).round().max(8.0) as u32;
+    let cur = current.min(frames - 1);
+    ui.label(RichText::new(format!("{frames} frame(s) · click one to start from it")).small().color(Color32::from_gray(160)));
+    let mut chosen = None;
+    // as many columns as the panel is wide
+    let cols = ((ui.available_width() / (THUMB + 4.0 + ui.spacing().item_spacing.x)).floor() as usize).clamp(1, 16);
+    let rows = (frames as usize).div_ceil(cols);
+    egui::ScrollArea::vertical().max_height(ui.available_height()).auto_shrink([false, false]).show_rows(ui, THUMB + 16.0, rows, |ui, range| {
+        for row in range {
+            ui.horizontal(|ui| {
+                for c in 0..cols {
+                    let f = (row * cols + c) as u32;
+                    if f >= frames {
+                        break;
+                    }
+                    let (r, resp) = ui.allocate_exact_size(vec2(THUMB + 4.0, THUMB + 16.0), Sense::click());
+                    let thumb = Rect::from_min_size(r.min + vec2(2.0, 0.0), vec2(THUMB, THUMB));
+                    ui.painter().rect_filled(thumb, 2.0, Color32::from_gray(0x26));
+                    // drawn the first time a thumbnail comes into view
+                    if !cache.tex.contains_key(&f) {
+                        if let Some(img) = frame_thumb(doc, &sym.timeline, f, cache.bounds, px, ppp) {
+                            let t = ui.ctx().load_texture(format!("fp-{symbol}-{f}"), img, egui::TextureOptions::LINEAR);
+                            cache.tex.insert(f, t);
+                        }
+                    }
+                    if let Some(t) = cache.tex.get(&f) {
+                        ui.painter().image(t.id(), thumb, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                    }
+                    let outline = if f == cur {
+                        EStroke::new(2.0_f32, ACCENT)
+                    } else if resp.hovered() {
+                        EStroke::new(1.0_f32, Color32::from_gray(200))
+                    } else {
+                        EStroke::new(1.0_f32, Color32::from_gray(70))
+                    };
+                    ui.painter().rect_stroke(thumb, 2.0, outline);
+                    ui.painter().text(pos2(r.center().x, r.bottom() - 1.0), Align2::CENTER_BOTTOM, (f + 1).to_string(), FontId::proportional(10.5), Color32::from_gray(190));
+                    if resp.clicked() {
+                        chosen = Some(f);
+                    }
+                    resp.on_hover_text(format!("Frame {}", f + 1));
+                }
+            });
+        }
+    });
+    chosen
+}
+
+/// One frame of a symbol drawn into a `px`-square image, framed by `bounds`.
+fn frame_thumb(doc: &ac_core::Document, tl: &ac_core::Timeline, f: u32, bounds: Option<(Pt, Pt)>, px: u32, ppp: f32) -> Option<egui::ColorImage> {
+    let mut pix = sk::Pixmap::new(px, px)?;
+    if let Some((lo, hi)) = bounds {
+        let mut items = Vec::new();
+        ac_core::evaluate(&ac_core::EvalCtx::new(doc, f), tl, f, &Matrix::IDENTITY, 1.0, 1, &mut items);
+        let p = px as f32;
+        let s = ((p - 8.0) / (hi.x - lo.x).max(1.0)).min((p - 8.0) / (hi.y - lo.y).max(1.0)).min(6.0 * ppp);
+        let view = Matrix::translate(p / 2.0, p / 2.0).concat(&Matrix::scale(s, s)).concat(&Matrix::translate(-(lo.x + hi.x) / 2.0, -(lo.y + hi.y) / 2.0));
+        ac_render::draw_items(&mut pix.as_mut(), &items, &ac_render::RenderOpts { view, ..Default::default() });
+    }
+    Some(egui::ColorImage::from_rgba_premultiplied([px as usize, px as usize], pix.data()))
+}
+
 /// Render the selected library item at `frame` into the preview texture.
 fn library_preview(app: &mut App, ui: &mut egui::Ui, prev_rect: Rect) {
     ui.painter().rect_filled(prev_rect, 3.0, Color32::from_gray(0x26));
@@ -1425,20 +1631,22 @@ fn library(app: &mut App, ui: &mut egui::Ui) {
         }
     }
     let q = app.lib.search.to_lowercase();
+    // one walk over the document for every symbol's use count (not one walk per symbol)
+    let usage = app.ed.symbol_usage_all();
     let mut syms: Vec<(u32, String, SymbolKind, u32, usize)> = app
         .ed
         .doc
         .library
         .iter()
         .filter(|s| s.name != ac_core::editor::GROUP_EDIT_NAME && (q.is_empty() || s.name.to_lowercase().contains(&q)))
-        .map(|s| (s.id, s.name.clone(), s.kind, s.timeline.frame_count(), app.ed.symbol_usage(s.id)))
+        .map(|s| (s.id, s.name.clone(), s.kind, s.timeline.frame_count(), usage.get(&s.id).copied().unwrap_or(0)))
         .collect();
     let kind_name = |k: SymbolKind| match k { SymbolKind::Graphic => "Graphic", SymbolKind::MovieClip => "Movie Clip", SymbolKind::Button => "Button" };
     match app.lib.sort.0 {
         1 => syms.sort_by(|a, b| kind_name(a.2).cmp(kind_name(b.2))),
         2 => syms.sort_by_key(|s| s.4),
         3 => syms.sort_by_key(|s| s.3),
-        _ => syms.sort_by_key(|s| s.1.to_lowercase()),
+        _ => syms.sort_by_cached_key(|s| s.1.to_lowercase()),
     }
     if !app.lib.sort.1 {
         syms.reverse();
@@ -1460,22 +1668,28 @@ fn library(app: &mut App, ui: &mut egui::Ui) {
     let searching = !q.is_empty();
     // rows: (depth, Some(folder path) | None, item)
     let mut rows: Vec<(usize, Option<String>, Option<LibItem>)> = vec![];
-    fn walk(path: &str, depth: usize, folders: &[String], items: &[(LibItem, String)], open: &std::collections::BTreeSet<String>, rows: &mut Vec<(usize, Option<String>, Option<LibItem>)>) {
+    // items grouped by their folder once, instead of scanning every item for every folder
+    let mut by_folder: std::collections::HashMap<&str, Vec<LibItem>> = Default::default();
+    for (it, n) in &items {
+        by_folder.entry(ac_core::split_item_path(n).0).or_default().push(*it);
+    }
+    fn walk(path: &str, depth: usize, folders: &[String], by_folder: &std::collections::HashMap<&str, Vec<LibItem>>, open: &std::collections::BTreeSet<String>, rows: &mut Vec<(usize, Option<String>, Option<LibItem>)>) {
         for f in folders.iter().filter(|f| ac_core::split_item_path(f).0 == path) {
             rows.push((depth, Some(f.clone()), None));
             if open.contains(f) {
-                walk(f, depth + 1, folders, items, open, rows);
+                walk(f, depth + 1, folders, by_folder, open, rows);
             }
         }
-        for (it, n) in items.iter().filter(|(_, n)| ac_core::split_item_path(n).0 == path) {
-            let _ = n;
-            rows.push((depth, None, Some(*it)));
+        if let Some(list) = by_folder.get(path) {
+            for it in list {
+                rows.push((depth, None, Some(*it)));
+            }
         }
     }
     if searching {
         rows.extend(items.iter().map(|(it, _)| (0, None, Some(*it))));
     } else {
-        walk("", 0, &folders, &items, &app.lib.open_folders, &mut rows);
+        walk("", 0, &folders, &by_folder, &app.lib.open_folders, &mut rows);
     }
     let dragging = app.lib_drag.map(LibItem::Symbol).or(app.lib.drag_bitmap.map(LibItem::Bitmap)).or(app.lib.drag_sound.map(LibItem::Sound));
     let released = ui.input(|i| i.pointer.any_released());
@@ -1493,7 +1707,15 @@ fn library(app: &mut App, ui: &mut egui::Ui) {
                 drop_into = Some(String::new());
             }
         }
+        // Rows are all 22 px tall. Only build the ones in view; the rest just keep their place
+        // (this also skips their per-item usage scans).
+        let visible = ui.clip_rect();
         for (depth, folder, item) in rows {
+            let row_top = ui.cursor().top();
+            if row_top + 22.0 < visible.top() || row_top > visible.bottom() {
+                ui.allocate_exact_size(vec2(w, 22.0), Sense::hover());
+                continue;
+            }
             let indent = 14.0 * depth as f32;
             if let Some(path) = folder {
                 let leaf = ac_core::split_item_path(&path).1.to_string();
@@ -1646,7 +1868,7 @@ fn library(app: &mut App, ui: &mut egui::Ui) {
                     let Some(s) = app.ed.doc.symbol(id) else { continue };
                     let (name, kind, frames) = (s.name.clone(), s.kind, s.timeline.frame_count());
                     let leaf = ac_core::split_item_path(&name).1.to_string();
-                    let uses = app.ed.symbol_usage(id);
+                    let uses = usage.get(&id).copied().unwrap_or(0);
                     let linked = app.ed.doc.linkage.get(&id).cloned();
                     let (r, resp) = ui.allocate_exact_size(vec2(w, 22.0), Sense::click_and_drag());
                     let selected = app.lib_selected == Some(id);
